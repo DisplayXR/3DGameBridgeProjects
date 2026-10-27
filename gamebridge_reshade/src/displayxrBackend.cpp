@@ -1,0 +1,592 @@
+/*
+ * This file falls under the GNU General Public License v3.0 license: See the LICENSE.txt in the root of this project for more info.
+ * Summary:
+ * Permissions of this strong copyleft license are conditioned on making available complete source code of licensed works and modifications, which include larger works using a licensed work, under the same license.
+ * Copyright and license notices must be preserved. Contributors provide an express grant of patent rights. Modifications to the source code must be disclosed publicly.
+ */
+
+#include "displayxrBackend.h"
+#include "configManager.h"
+#include "gbConstants.h"
+
+#include <openxr/openxr_loader_negotiation.h>
+#include <openxr/XR_DXR_win32_window_binding.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <vector>
+
+static std::atomic<bool> teardown_abandoned{false};
+
+static void log_info(const std::string& message) {
+    reshade::log_message(reshade::log_level::info, ("DisplayXR: " + message).c_str());
+}
+
+static void log_warning(const std::string& message) {
+    reshade::log_message(reshade::log_level::warning, ("DisplayXR: " + message).c_str());
+}
+
+static const char* session_state_name(XrSessionState state) {
+    switch (state) {
+    case XR_SESSION_STATE_IDLE: return "IDLE";
+    case XR_SESSION_STATE_READY: return "READY";
+    case XR_SESSION_STATE_SYNCHRONIZED: return "SYNCHRONIZED";
+    case XR_SESSION_STATE_VISIBLE: return "VISIBLE";
+    case XR_SESSION_STATE_FOCUSED: return "FOCUSED";
+    case XR_SESSION_STATE_STOPPING: return "STOPPING";
+    case XR_SESSION_STATE_LOSS_PENDING: return "LOSS_PENDING";
+    case XR_SESSION_STATE_EXITING: return "EXITING";
+    default: return "UNKNOWN";
+    }
+}
+
+// The manifest of the active OpenXR runtime, looked up the way the OpenXR loader does it: XR_RUNTIME_JSON, then the
+// per-user and the machine ActiveRuntime value. A 32-bit process reads the 32-bit registry view, so it only finds a
+// runtime that was registered for 32-bit applications.
+static std::string find_active_runtime_manifest() {
+    char buffer[MAX_PATH * 2];
+    DWORD length = GetEnvironmentVariableA("XR_RUNTIME_JSON", buffer, sizeof(buffer));
+    if (length > 0 && length < sizeof(buffer)) {
+        return buffer;
+    }
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        DWORD size = sizeof(buffer);
+        if (RegGetValueA(root, "SOFTWARE\\Khronos\\OpenXR\\1", "ActiveRuntime", RRF_RT_REG_SZ, nullptr, buffer, &size) == ERROR_SUCCESS && buffer[0] != '\0') {
+            return buffer;
+        }
+    }
+    return "";
+}
+
+// Reads "library_path" from a runtime manifest and makes it absolute (relative paths are relative to the manifest).
+static std::wstring read_runtime_library_path(const std::string& manifest_path) {
+    std::ifstream file(manifest_path);
+    if (!file) {
+        return L"";
+    }
+    std::stringstream contents;
+    contents << file.rdbuf();
+    const std::string json = contents.str();
+
+    size_t pos = json.find("\"library_path\"");
+    if (pos == std::string::npos || (pos = json.find(':', pos)) == std::string::npos || (pos = json.find('"', pos)) == std::string::npos) {
+        return L"";
+    }
+    std::string library;
+    for (++pos; pos < json.size() && json[pos] != '"'; ++pos) {
+        if (json[pos] == '\\' && pos + 1 < json.size()) {
+            ++pos;
+        }
+        library += json[pos];
+    }
+
+    const bool absolute = library.size() > 1 && (library[1] == ':' || (library[0] == '\\' && library[1] == '\\'));
+    if (!absolute) {
+        const size_t separator = manifest_path.find_last_of("\\/");
+        library = (separator == std::string::npos ? std::string() : manifest_path.substr(0, separator + 1)) + library;
+    }
+    // LoadLibraryEx only accepts backslashes with LOAD_WITH_ALTERED_SEARCH_PATH
+    for (char& c : library) {
+        if (c == '/') {
+            c = '\\';
+        }
+    }
+
+    const int wide_length = MultiByteToWideChar(CP_UTF8, 0, library.c_str(), -1, nullptr, 0);
+    std::wstring wide(wide_length > 0 ? wide_length - 1 : 0, L'\0');
+    if (wide_length > 1) {
+        MultiByteToWideChar(CP_UTF8, 0, library.c_str(), -1, &wide[0], wide_length);
+    }
+    return wide;
+}
+
+bool DisplayXRBackend::is_requested() {
+    // Read directly: ConfigManager only parses booleans and integers.
+    char value[32] = {};
+    size_t size = sizeof(value);
+    if (!reshade::get_config_value(nullptr, gb_config_section_name.c_str(), gb_config_backend.c_str(), value, &size)) {
+        return false;
+    }
+    std::string backend(value);
+    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return backend == gb_config_backend_displayxr;
+}
+
+DisplayXRBackend* DisplayXRBackend::try_create(reshade::api::effect_runtime* runtime) {
+    auto* backend = new DisplayXRBackend();
+    if (backend->initialize(runtime)) {
+        log_info("using DisplayXR runtime '" + backend->runtime_name + "' for weaving");
+        return backend;
+    }
+    log_warning(backend->status_message + " Falling back to the SR weaver.");
+    delete backend;
+    return nullptr;
+}
+
+bool DisplayXRBackend::is_output_runtime(reshade::api::effect_runtime* runtime) {
+    return DisplayXROverlayWindow::is_overlay_window(static_cast<HWND>(runtime->get_hwnd()));
+}
+
+void DisplayXRBackend::abandon_teardown() {
+    teardown_abandoned.store(true);
+}
+
+bool DisplayXRBackend::load_runtime() {
+    const std::string manifest = find_active_runtime_manifest();
+    if (manifest.empty()) {
+        status_message = "No active OpenXR runtime is registered.";
+        return false;
+    }
+    const std::wstring library = read_runtime_library_path(manifest);
+    if (library.empty()) {
+        status_message = "Cannot read library_path from the OpenXR runtime manifest " + manifest + ".";
+        return false;
+    }
+    // Deliberately never unloaded: the runtime may keep threads alive after the session is gone.
+    runtime_module = LoadLibraryExW(library.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (runtime_module == nullptr) {
+        status_message = "Cannot load the OpenXR runtime of " + manifest + " (error " + std::to_string(GetLastError()) + ").";
+        return false;
+    }
+
+    auto negotiate = reinterpret_cast<PFN_xrNegotiateLoaderRuntimeInterface>(GetProcAddress(runtime_module, "xrNegotiateLoaderRuntimeInterface"));
+    if (negotiate == nullptr) {
+        status_message = "The OpenXR runtime does not export xrNegotiateLoaderRuntimeInterface.";
+        return false;
+    }
+    XrNegotiateLoaderInfo loader_info = {};
+    loader_info.structType = XR_LOADER_INTERFACE_STRUCT_LOADER_INFO;
+    loader_info.structVersion = XR_LOADER_INFO_STRUCT_VERSION;
+    loader_info.structSize = sizeof(loader_info);
+    loader_info.minInterfaceVersion = 1;
+    loader_info.maxInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
+    loader_info.minApiVersion = XR_MAKE_VERSION(1, 0, 0);
+    loader_info.maxApiVersion = XR_MAKE_VERSION(1, 0x3ff, 0xfff);
+    XrNegotiateRuntimeRequest request = {};
+    request.structType = XR_LOADER_INTERFACE_STRUCT_RUNTIME_REQUEST;
+    request.structVersion = XR_RUNTIME_INFO_STRUCT_VERSION;
+    request.structSize = sizeof(request);
+    if (XR_FAILED(negotiate(&loader_info, &request)) || request.getInstanceProcAddr == nullptr) {
+        status_message = "OpenXR runtime interface negotiation failed.";
+        return false;
+    }
+    get_proc_addr = request.getInstanceProcAddr;
+    return true;
+}
+
+template <typename T>
+static void resolve(PFN_xrGetInstanceProcAddr get_proc_addr, XrInstance instance, const char* name, T& function) {
+    get_proc_addr(instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&function));
+}
+
+void DisplayXRBackend::resolve_functions() {
+    resolve(get_proc_addr, instance, "xrDestroyInstance", xrDestroyInstance);
+    resolve(get_proc_addr, instance, "xrPollEvent", xrPollEvent);
+    resolve(get_proc_addr, instance, "xrBeginSession", xrBeginSession);
+    resolve(get_proc_addr, instance, "xrEndSession", xrEndSession);
+    resolve(get_proc_addr, instance, "xrDestroySession", xrDestroySession);
+    resolve(get_proc_addr, instance, "xrDestroySpace", xrDestroySpace);
+    resolve(get_proc_addr, instance, "xrWaitFrame", xrWaitFrame);
+    resolve(get_proc_addr, instance, "xrBeginFrame", xrBeginFrame);
+    resolve(get_proc_addr, instance, "xrEndFrame", xrEndFrame);
+    resolve(get_proc_addr, instance, "xrLocateViews", xrLocateViews);
+    resolve(get_proc_addr, instance, "xrEnumerateSwapchainFormats", xrEnumerateSwapchainFormats);
+    resolve(get_proc_addr, instance, "xrCreateSwapchain", xrCreateSwapchain);
+    resolve(get_proc_addr, instance, "xrDestroySwapchain", xrDestroySwapchain);
+    resolve(get_proc_addr, instance, "xrAcquireSwapchainImage", xrAcquireSwapchainImage);
+    resolve(get_proc_addr, instance, "xrWaitSwapchainImage", xrWaitSwapchainImage);
+    resolve(get_proc_addr, instance, "xrReleaseSwapchainImage", xrReleaseSwapchainImage);
+}
+
+bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
+    reshade::api::device* device = runtime->get_device();
+    switch (device->get_api()) {
+    case reshade::api::device_api::d3d11:
+        graphics = create_displayxr_graphics_d3d11(device);
+        break;
+    case reshade::api::device_api::d3d12:
+        graphics = create_displayxr_graphics_d3d12(device, runtime->get_command_queue());
+        break;
+    default:
+        status_message = "The DisplayXR backend supports D3D11 and D3D12 games only.";
+        return false;
+    }
+
+    if (!load_runtime()) {
+        return false;
+    }
+
+    // The window binding extension is what makes the active runtime a DisplayXR runtime we can drive.
+    PFN_xrEnumerateInstanceExtensionProperties enumerate_extensions = nullptr;
+    resolve(get_proc_addr, XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties", enumerate_extensions);
+    PFN_xrCreateInstance create_instance = nullptr;
+    resolve(get_proc_addr, XR_NULL_HANDLE, "xrCreateInstance", create_instance);
+    uint32_t extension_count = 0;
+    if (enumerate_extensions == nullptr || create_instance == nullptr || XR_FAILED(enumerate_extensions(nullptr, 0, &extension_count, nullptr))) {
+        status_message = "Cannot enumerate the OpenXR runtime's extensions.";
+        return false;
+    }
+    std::vector<XrExtensionProperties> extensions(extension_count, { XR_TYPE_EXTENSION_PROPERTIES });
+    enumerate_extensions(nullptr, extension_count, &extension_count, extensions.data());
+    bool has_graphics = false, has_window_binding = false;
+    for (const XrExtensionProperties& extension : extensions) {
+        has_graphics |= std::strcmp(extension.extensionName, graphics->extension_name()) == 0;
+        has_window_binding |= std::strcmp(extension.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0;
+    }
+    if (!has_window_binding) {
+        status_message = "The active OpenXR runtime is not DisplayXR (no " XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME ").";
+        return false;
+    }
+    if (!has_graphics) {
+        status_message = std::string("The DisplayXR runtime does not support ") + graphics->extension_name() + ".";
+        return false;
+    }
+
+    const char* enabled_extensions[] = { graphics->extension_name(), XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME };
+    XrInstanceCreateInfo instance_info = { XR_TYPE_INSTANCE_CREATE_INFO };
+    std::strncpy(instance_info.applicationInfo.applicationName, "3DGameBridge", XR_MAX_APPLICATION_NAME_SIZE - 1);
+    std::strncpy(instance_info.applicationInfo.engineName, "ReShade", XR_MAX_ENGINE_NAME_SIZE - 1);
+    instance_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    instance_info.enabledExtensionCount = 2;
+    instance_info.enabledExtensionNames = enabled_extensions;
+    XrResult result = create_instance(&instance_info, &instance);
+    if (XR_FAILED(result)) {
+        status_message = "xrCreateInstance failed (" + std::to_string(result) + ").";
+        return false;
+    }
+    resolve_functions();
+
+    PFN_xrGetInstanceProperties get_instance_properties = nullptr;
+    resolve(get_proc_addr, instance, "xrGetInstanceProperties", get_instance_properties);
+    XrInstanceProperties properties = { XR_TYPE_INSTANCE_PROPERTIES };
+    if (get_instance_properties != nullptr && XR_SUCCEEDED(get_instance_properties(instance, &properties))) {
+        runtime_name = std::string(properties.runtimeName) + " " + std::to_string(XR_VERSION_MAJOR(properties.runtimeVersion)) + "." +
+                       std::to_string(XR_VERSION_MINOR(properties.runtimeVersion)) + "." + std::to_string(XR_VERSION_PATCH(properties.runtimeVersion));
+    }
+
+    PFN_xrGetSystem get_system = nullptr;
+    resolve(get_proc_addr, instance, "xrGetSystem", get_system);
+    XrSystemGetInfo system_info = { XR_TYPE_SYSTEM_GET_INFO };
+    system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    if (get_system == nullptr || XR_FAILED(get_system(instance, &system_info, &system_id))) {
+        status_message = "xrGetSystem failed: no 3D display found by the runtime.";
+        return false;
+    }
+    if (!graphics->check_requirements(instance, system_id, get_proc_addr)) {
+        status_message = std::string("The graphics requirements call of ") + graphics->extension_name() + " failed.";
+        return false;
+    }
+
+    // The runtime presents into a window of its own on top of the game's: see DisplayXROverlayWindow.
+    overlay = new DisplayXROverlayWindow();
+    HWND overlay_hwnd = overlay->create(static_cast<HWND>(runtime->get_hwnd()));
+    if (overlay_hwnd == nullptr) {
+        status_message = "Cannot create the DisplayXR output window.";
+        return false;
+    }
+
+    XrWin32WindowBindingCreateInfoDXR window_binding = { XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR };
+    window_binding.windowHandle = overlay_hwnd;
+    XrSessionCreateInfo session_info = { XR_TYPE_SESSION_CREATE_INFO };
+    session_info.next = graphics->session_binding(&window_binding);
+    session_info.systemId = system_id;
+    PFN_xrCreateSession create_session = nullptr;
+    resolve(get_proc_addr, instance, "xrCreateSession", create_session);
+    result = create_session(instance, &session_info, &session);
+    if (XR_FAILED(result)) {
+        status_message = "xrCreateSession failed (" + std::to_string(result) + ").";
+        return false;
+    }
+
+    PFN_xrCreateReferenceSpace create_space = nullptr;
+    resolve(get_proc_addr, instance, "xrCreateReferenceSpace", create_space);
+    XrReferenceSpaceCreateInfo space_info = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    space_info.poseInReferenceSpace.orientation.w = 1.0f;
+    if (XR_FAILED(create_space(session, &space_info, &space))) {
+        status_message = "xrCreateReferenceSpace failed.";
+        return false;
+    }
+    return true;
+}
+
+DisplayXRBackend::~DisplayXRBackend() {
+    if (teardown_abandoned.load()) {
+        // Under the loader lock at process exit: the runtime's and the overlay's threads are gone or cannot be
+        // joined. Leave everything to the process teardown.
+        return;
+    }
+    destroy_swapchain();
+    if (space != XR_NULL_HANDLE) {
+        xrDestroySpace(space);
+    }
+    if (session != XR_NULL_HANDLE) {
+        xrDestroySession(session);
+    }
+    if (instance != XR_NULL_HANDLE) {
+        xrDestroyInstance(instance);
+    }
+    if (overlay != nullptr) {
+        overlay->destroy(true);
+        delete overlay;
+    }
+    delete graphics;
+}
+
+void DisplayXRBackend::poll_events() {
+    XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
+    while (xrPollEvent(instance, &event) == XR_SUCCESS) {
+        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            session_state = reinterpret_cast<XrEventDataSessionStateChanged&>(event).state;
+            log_info(std::string("session state ") + session_state_name(session_state));
+            switch (session_state) {
+            case XR_SESSION_STATE_READY: {
+                XrSessionBeginInfo begin_info = { XR_TYPE_SESSION_BEGIN_INFO };
+                begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                session_running = XR_SUCCEEDED(xrBeginSession(session, &begin_info));
+                break;
+            }
+            case XR_SESSION_STATE_STOPPING:
+                xrEndSession(session);
+                session_running = false;
+                break;
+            case XR_SESSION_STATE_LOSS_PENDING:
+            case XR_SESSION_STATE_EXITING:
+                session_running = false;
+                session_lost = true;
+                overlay->set_visible(false);
+                status_message = "The DisplayXR session ended. Restart the game to weave again.";
+                break;
+            default:
+                break;
+            }
+        }
+        else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+            session_running = false;
+            session_lost = true;
+            overlay->set_visible(false);
+            status_message = "The DisplayXR runtime is shutting down. Restart the game to weave again.";
+        }
+        event = { XR_TYPE_EVENT_DATA_BUFFER };
+    }
+}
+
+void DisplayXRBackend::destroy_swapchain() {
+    if (swapchain != XR_NULL_HANDLE) {
+        graphics->release_images();
+        xrDestroySwapchain(swapchain);
+        swapchain = XR_NULL_HANDLE;
+    }
+    swapchain_width = swapchain_height = 0;
+    swapchain_source_format = reshade::api::format::unknown;
+}
+
+bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc) {
+    if (swapchain != XR_NULL_HANDLE && desc.texture.width == swapchain_width && desc.texture.height == swapchain_height && desc.texture.format == swapchain_source_format) {
+        return true;
+    }
+    destroy_swapchain();
+    if (swapchain_failed) {
+        return false;
+    }
+    if (desc.texture.samples > 1) {
+        status_message = "Multisampled back buffers are not supported.";
+        swapchain_failed = true;
+        return false;
+    }
+
+    // The game's 8-bit back buffer holds display-encoded (sRGB) values. DisplayXR reads a UNORM swapchain as linear
+    // and an _SRGB swapchain as encoded, so the same bytes go into the _SRGB variant: a raw copy, no conversion.
+    // Formats without an _SRGB variant (10-bit, float) are used as they are.
+    const reshade::api::format typed = reshade::api::format_to_default_typed(desc.texture.format, 0);
+    const reshade::api::format srgb = reshade::api::format_to_default_typed(desc.texture.format, 1);
+    std::vector<reshade::api::format> candidates;
+    if (srgb != typed) {
+        candidates.push_back(srgb);
+    }
+    candidates.push_back(typed);
+
+    uint32_t format_count = 0;
+    xrEnumerateSwapchainFormats(session, 0, &format_count, nullptr);
+    std::vector<int64_t> formats(format_count);
+    xrEnumerateSwapchainFormats(session, format_count, &format_count, formats.data());
+    reshade::api::format chosen = reshade::api::format::unknown;
+    for (reshade::api::format candidate : candidates) {
+        for (int64_t format : formats) {
+            if (format == graphics->native_format(candidate)) {
+                chosen = candidate;
+                break;
+            }
+        }
+        if (chosen != reshade::api::format::unknown) {
+            break;
+        }
+    }
+    if (chosen == reshade::api::format::unknown) {
+        status_message = "The runtime offers no swapchain format matching the back buffer (" + std::to_string(static_cast<uint32_t>(desc.texture.format)) + ").";
+        swapchain_failed = true;
+        return false;
+    }
+
+    XrSwapchainCreateInfo swapchain_info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    swapchain_info.format = graphics->native_format(chosen);
+    swapchain_info.sampleCount = 1;
+    swapchain_info.width = desc.texture.width;
+    swapchain_info.height = desc.texture.height;
+    swapchain_info.faceCount = 1;
+    swapchain_info.arraySize = 1;
+    swapchain_info.mipCount = 1;
+    XrResult result = xrCreateSwapchain(session, &swapchain_info, &swapchain);
+    if (XR_FAILED(result) || !graphics->enumerate_images(swapchain, get_proc_addr, instance)) {
+        status_message = "xrCreateSwapchain failed (" + std::to_string(result) + ").";
+        swapchain_failed = true;
+        destroy_swapchain();
+        return false;
+    }
+
+    swapchain_width = desc.texture.width;
+    swapchain_height = desc.texture.height;
+    swapchain_source_format = desc.texture.format;
+    format_name = std::to_string(static_cast<uint32_t>(chosen)) + (chosen == srgb && srgb != typed ? " (sRGB)" : "");
+    if (srgb == typed && (typed == reshade::api::format::r10g10b10a2_unorm || typed == reshade::api::format::b10g10r10a2_unorm)) {
+        log_warning("10-bit UNORM back buffer: the runtime reads it as linear, colors may look washed out.");
+    }
+    log_info("swapchain " + std::to_string(swapchain_width) + "x" + std::to_string(swapchain_height) + " format " + format_name);
+    return true;
+}
+
+GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view) {
+    if (session_lost) {
+        return SUCCESS;
+    }
+    poll_events();
+    if (!session_running) {
+        return SUCCESS;
+    }
+
+    XrFrameState frame_state = { XR_TYPE_FRAME_STATE };
+    if (XR_FAILED(xrWaitFrame(session, nullptr, &frame_state))) {
+        return GENERAL_FAIL;
+    }
+    if (XR_FAILED(xrBeginFrame(session, nullptr))) {
+        return GENERAL_FAIL;
+    }
+
+    XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    XrCompositionLayerProjectionView projection_views[2] = { { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }, { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW } };
+    const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer) };
+    uint32_t layer_count = 0;
+
+    if (frame_state.shouldRender && weaving_enabled && !reshade_overlay_open) {
+        reshade::api::device* device = runtime->get_device();
+        const reshade::api::resource back_buffer = device->get_resource_from_view(rtv);
+        const reshade::api::resource_desc desc = device->get_resource_desc(back_buffer);
+        current_buffer_format = desc.texture.format;
+
+        XrViewLocateInfo locate_info = { XR_TYPE_VIEW_LOCATE_INFO };
+        locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate_info.displayTime = frame_state.predictedDisplayTime;
+        locate_info.space = space;
+        XrViewState view_state = { XR_TYPE_VIEW_STATE };
+        XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+        uint32_t view_count = 0;
+
+        if (ensure_swapchain(desc) &&
+            XR_SUCCEEDED(xrLocateViews(session, &locate_info, &view_state, 2, &view_count, views)) && view_count == 2) {
+            uint32_t image_index = 0;
+            XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+            wait_info.timeout = XR_INFINITE_DURATION;
+            if (XR_SUCCEEDED(xrAcquireSwapchainImage(swapchain, nullptr, &image_index)) &&
+                XR_SUCCEEDED(xrWaitSwapchainImage(swapchain, &wait_info))) {
+                const bool copied = graphics->copy_to_image(runtime, cmd_list, back_buffer, image_index);
+                xrReleaseSwapchainImage(swapchain, nullptr);
+
+                if (copied) {
+                    // The back buffer is side-by-side: the left half is the left eye, the right half the right eye.
+                    // The game rendered both eyes itself, so the views only echo the runtime's poses back.
+                    const int32_t half_width = static_cast<int32_t>(swapchain_width / 2);
+                    for (uint32_t eye = 0; eye < 2; eye++) {
+                        projection_views[eye].pose = views[eye].pose;
+                        projection_views[eye].fov = views[eye].fov;
+                        projection_views[eye].subImage.swapchain = swapchain;
+                        projection_views[eye].subImage.imageRect.offset = { static_cast<int32_t>(eye) * half_width, 0 };
+                        projection_views[eye].subImage.imageRect.extent = { half_width, static_cast<int32_t>(swapchain_height) };
+                        projection_views[eye].subImage.imageArrayIndex = 0;
+                    }
+                    layer.space = space;
+                    layer.viewCount = 2;
+                    layer.views = projection_views;
+                    layer_count = 1;
+                }
+            }
+        }
+    }
+
+    XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
+    end_info.displayTime = frame_state.predictedDisplayTime;
+    end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    end_info.layerCount = layer_count;
+    end_info.layers = layers;
+    if (XR_FAILED(xrEndFrame(session, &end_info))) {
+        return GENERAL_FAIL;
+    }
+    if (layer_count > 0) {
+        frames_submitted++;
+    }
+    return SUCCESS;
+}
+
+void DisplayXRBackend::on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
+    // ReShade re-creates the effect runtime when the game resizes its swapchain; the session survives that.
+    // The window binding is fixed at session creation though, so a swapchain moved to another window is not followed.
+    if (overlay != nullptr && GetWindow(overlay->get_hwnd(), GW_OWNER) != static_cast<HWND>(runtime->get_hwnd())) {
+        log_warning("the game presents to a different window than the one DisplayXR was bound to.");
+    }
+}
+
+void DisplayXRBackend::on_reshade_overlay(bool open) {
+    reshade_overlay_open = open;
+    if (overlay != nullptr) {
+        overlay->set_visible(!open && weaving_enabled);
+    }
+}
+
+void DisplayXRBackend::do_weave(bool do_weave) {
+    weaving_enabled = do_weave;
+    if (overlay != nullptr) {
+        overlay->set_visible(do_weave && !reshade_overlay_open);
+    }
+}
+
+LatencyModes DisplayXRBackend::get_latency_mode() {
+    // The runtime predicts the eye positions itself
+    return LatencyModes::LATENCY_IN_FRAMES_AUTOMATIC;
+}
+
+bool DisplayXRBackend::set_latency_in_frames(int32_t) {
+    return false;
+}
+
+bool DisplayXRBackend::set_latency_frametime_adaptive(uint32_t) {
+    return false;
+}
+
+void DisplayXRBackend::draw_status_overlay(reshade::api::effect_runtime*, const std::string& error_message) {
+    ImGui::TextUnformatted("Status: ACTIVE (DisplayXR)");
+    ImGui::Text("Runtime: %s", runtime_name.c_str());
+    ImGui::Text("Session: %s", session_state_name(session_state));
+    if (swapchain != XR_NULL_HANDLE) {
+        ImGui::Text("Swapchain: %ux%u, format %s", swapchain_width, swapchain_height, format_name.c_str());
+    }
+    ImGui::Text("Frames submitted: %llu", static_cast<unsigned long long>(frames_submitted));
+    ImGui::TextUnformatted("The woven image is hidden while this overlay is open.");
+    const std::string& message = error_message.empty() ? status_message : error_message;
+    if (!message.empty()) {
+        ImGui::TextColored(ImColor(240, 100, 100), "%s", message.c_str());
+    }
+}

@@ -96,6 +96,26 @@ Key bindings are structured like this:<br/> `[hex_keycode]\;[modifier_key]\;[mod
 - The supported keycodes can be found in the "value" column [here](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes).
 - The supported modifier keys are: `shift`, `ctrl` and `alt`
 
+# Optional: DisplayXR weaving backend
+
+By default the add-on weaves with the SR SDK. It can instead hand the side-by-side frame to a [DisplayXR](https://github.com/DisplayXR/displayxr-runtime) OpenXR runtime, which weaves and presents it through its display plug-in (D3D11 and D3D12 games, 64-bit).
+
+To enable it, set the backend in the `[3DGameBridge]` section of `ReShade.ini`:
+
+``` .ini
+[3DGameBridge]
+backend=displayxr
+```
+
+`backend=sr` (the default, written on first start) keeps the SR weaver.
+
+How it works:
+- The add-on loads the active OpenXR runtime itself (the `ActiveRuntime` registry value, or `XR_RUNTIME_JSON`). It creates an OpenXR session on the game's own graphics device, and every frame submits the left and right halves of the back buffer as the two eye views. The game itself needs no OpenXR support.
+- The runtime presents the woven image into a borderless window that the add-on keeps over the game's client area. That window never takes focus and ignores the mouse, so all input still goes to the game.
+- While the ReShade overlay is open, the woven image is hidden so the menu stays readable.
+
+The add-on silently falls back to the SR weaver when the DisplayXR backend cannot be used: no OpenXR runtime is registered, the active runtime is not DisplayXR, the game is 32-bit (DisplayXR has no 32-bit runtime), or the session cannot be created. The reason is written to the ReShade log.
+
 ## 
 
 ## Backup links for files (Google Drive):
