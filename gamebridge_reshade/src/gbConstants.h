@@ -16,6 +16,7 @@ const std::string gb_config_disable_3d_when_no_user_grace_duration = "disable_3d
 const std::string gb_config_backend = "backend";
 const std::string gb_config_backend_sr = "sr";
 const std::string gb_config_backend_displayxr = "displayxr";
+const std::string gb_config_displayxr_auto_2d = "displayxr_auto_2d";
 const std::string gb_config_toggle_sr_key = "toggle_sr_key";
 const std::string gb_config_toggle_lens_key = "toggle_lens_key";
 const std::string gb_config_toggle_3d_key = "toggle_3d_key";

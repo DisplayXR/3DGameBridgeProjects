@@ -12,6 +12,7 @@
 #include "displayxrOverlayWindow.h"
 
 #include <openxr/openxr.h>
+#include <openxr/XR_DXR_display_info.h>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,18 @@ class DisplayXRBackend : public IGraphicsApi {
     reshade::api::resource_view convert_source_srv = {};
     std::vector<reshade::api::resource_view> convert_rtvs;
 
+    // Flat-picture detection: while the eyes show one flat picture (no stereo effect running, or a menu placed at a
+    // single depth), the display is switched to 2D through XR_DXR_display_info and both views show the left eye.
+    // Toggled with displayxr_auto_2d in [3DGameBridge].
+    bool auto_2d_enabled = true;
+    bool display_2d = false;
+    uint32_t mono_streak = 0, stereo_streak = 0;
+    uint64_t mono_probe_frame = 0, mono_probe_count = 0;
+    reshade::api::pipeline mono_probe_pipeline = {};
+    reshade::api::resource mono_probe_target = {};
+    reshade::api::resource_view mono_probe_rtv = {};
+    reshade::api::resource mono_probe_readback[3] = {};
+
     bool weaving_enabled = true;
     bool reshade_overlay_open = false;
     uint64_t frames_submitted = 0;
@@ -77,6 +90,7 @@ class DisplayXRBackend : public IGraphicsApi {
     PFN_xrAcquireSwapchainImage xrAcquireSwapchainImage = nullptr;
     PFN_xrWaitSwapchainImage xrWaitSwapchainImage = nullptr;
     PFN_xrReleaseSwapchainImage xrReleaseSwapchainImage = nullptr;
+    PFN_xrRequestDisplayModeDXR xrRequestDisplayModeDXR = nullptr;
 
     DisplayXRBackend() = default;
 
@@ -89,6 +103,12 @@ class DisplayXRBackend : public IGraphicsApi {
     void destroy_swapchain();
     bool ensure_swapchain(const reshade::api::resource_desc& desc);
     bool create_convert_pipeline(reshade::api::format target_format);
+    bool create_fullscreen_pipeline(const char* pixel_shader, reshade::api::format target_format, reshade::api::pipeline* out_pipeline);
+    bool copy_to_sampled_source(reshade::api::command_list* cmd_list, reshade::api::resource back_buffer);
+    bool create_mono_probe_resources();
+    void destroy_mono_probe_resources();
+    void update_mono_probe(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer);
+    void apply_mono_verdict(bool mono);
     void destroy_convert_resources();
     bool convert_to_image(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer, uint32_t image_index);
 

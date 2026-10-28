@@ -11,11 +11,14 @@
 
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/XR_DXR_win32_window_binding.h>
+#include <openxr/XR_DXR_display_info.h>
 
 #include <d3dcommon.h>
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
+#include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -137,7 +140,75 @@ float4 ps_main(float4 position : SV_Position) : SV_Target
     float3 high = pow((color.rgb + 0.055) / 1.055, 2.4);
     return float4(color.rgb <= 0.04045 ? low : high, color.a);
 }
+
+// Mono probe: reduces each eye to a MONO_GRID_X x MONO_GRID_Y grid of 8x16-sample averages, left eye in the left half of
+// the target and right eye in the right half.
+float4 ps_mono_probe(float4 position : SV_Position) : SV_Target
+{
+    uint width, height;
+    source.GetDimensions(width, height);
+    const float2 grid = float2(MONO_GRID_X, MONO_GRID_Y);
+    const float2 cell_size = float2(width * 0.5, height) / grid;
+    float2 cell = floor(position.xy);
+    float eye = cell.x >= grid.x ? 1.0 : 0.0;
+    float2 origin = float2(eye * width * 0.5, 0.0) + float2(cell.x - eye * grid.x, cell.y) * cell_size;
+    float4 sum = 0.0;
+    [loop] for (int y = 0; y < 16; y++)
+        [unroll] for (int x = 0; x < 8; x++)
+            sum += source.Load(int3(origin + (float2(x, y) + 0.5) * cell_size / float2(8.0, 16.0), 0));
+    return saturate(sum / 128.0);
+}
 )";
+
+// Size of the per-eye grid the mono probe reduces each eye to.
+// Fine horizontally, since the comparison searches for a horizontal shift between the eyes.
+static const uint32_t mono_grid_x = 256;
+static const uint32_t mono_grid_y = 24;
+
+// Mean absolute luma difference (0-255) between the left eye and the right eye shifted by `shift` grid cells, with
+// linear interpolation for fractional shifts. Only the overlapping part of the eyes counts.
+static double eye_difference(const std::vector<float>& left, const std::vector<float>& right, double shift) {
+    double sum = 0.0;
+    uint32_t count = 0;
+    for (uint32_t y = 0; y < mono_grid_y; y++) {
+        const float* l = &left[static_cast<size_t>(y) * mono_grid_x];
+        const float* r = &right[static_cast<size_t>(y) * mono_grid_x];
+        for (uint32_t x = 0; x < mono_grid_x; x++) {
+            const double rx = x - shift;
+            if (rx < 0.0 || rx > mono_grid_x - 1.0) {
+                continue;
+            }
+            const uint32_t x0 = static_cast<uint32_t>(rx);
+            const uint32_t x1 = x0 + 1 < mono_grid_x ? x0 + 1 : x0;
+            const double t = rx - x0;
+            sum += std::abs(l[x] - (r[x0] * (1.0 - t) + r[x1] * t));
+            count++;
+        }
+    }
+    return count > 0 ? sum / count : 0.0;
+}
+
+// Whether the eyes show one flat picture: identical, or identical up to a single horizontal shift (a stereo shader
+// placing a flat image at a fixed depth, as SuperDepth3D does on menus and loading screens).
+static bool eyes_are_flat(const std::vector<float>& left, const std::vector<float>& right) {
+    // Coarse search over whole cells (up to 1/5 of the eye's width), then refine around the best one.
+    const int max_shift = static_cast<int>(mono_grid_x / 5);
+    const double unshifted = eye_difference(left, right, 0.0);
+    double best_shift = 0.0, best = unshifted;
+    for (int shift = -max_shift; shift <= max_shift; shift++) {
+        const double difference = eye_difference(left, right, shift);
+        if (difference < best) {
+            best = difference;
+            best_shift = shift;
+        }
+    }
+    for (double shift = best_shift - 1.0; shift <= best_shift + 1.0; shift += 0.125) {
+        best = std::min(best, eye_difference(left, right, shift));
+    }
+    // Measured: a flat menu at a fixed depth leaves about 1.1 after the best shift (sampling noise), real stereo
+    // stays far above it. Requiring the shift to explain most of the difference guards low-contrast 3D scenes.
+    return unshifted < 3.0 || (best < 3.0 && best < 0.3 * unshifted);
+}
 
 // Compiles the conversion shader with the system's d3dcompiler_47.dll (part of Windows since 8.1).
 static ID3DBlob* compile_convert_shader(const char* entry_point, const char* target) {
@@ -147,9 +218,12 @@ static ID3DBlob* compile_convert_shader(const char* entry_point, const char* tar
     if (compile == nullptr) {
         return nullptr;
     }
+    struct Macro { const char* name; const char* definition; };
+    const std::string grid_x = std::to_string(mono_grid_x), grid_y = std::to_string(mono_grid_y);
+    const Macro macros[] = { { "MONO_GRID_X", grid_x.c_str() }, { "MONO_GRID_Y", grid_y.c_str() }, { nullptr, nullptr } };
     ID3DBlob* code = nullptr;
     ID3DBlob* errors = nullptr;
-    compile(convert_shader_source, sizeof(convert_shader_source) - 1, "displayxr_convert", nullptr, nullptr, entry_point, target, 0, 0, &code, &errors);
+    compile(convert_shader_source, sizeof(convert_shader_source) - 1, "displayxr_convert", macros, nullptr, entry_point, target, 0, 0, &code, &errors);
     if (errors != nullptr) {
         reshade::log_message(reshade::log_level::warning, static_cast<const char*>(errors->GetBufferPointer()));
         errors->Release();
@@ -286,10 +360,11 @@ bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
     }
     std::vector<XrExtensionProperties> extensions(extension_count, { XR_TYPE_EXTENSION_PROPERTIES });
     enumerate_extensions(nullptr, extension_count, &extension_count, extensions.data());
-    bool has_graphics = false, has_window_binding = false;
+    bool has_graphics = false, has_window_binding = false, has_display_info = false;
     for (const XrExtensionProperties& extension : extensions) {
         has_graphics |= std::strcmp(extension.extensionName, graphics->extension_name()) == 0;
         has_window_binding |= std::strcmp(extension.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0;
+        has_display_info |= std::strcmp(extension.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0;
     }
     if (!has_window_binding) {
         status_message = "The active OpenXR runtime is not DisplayXR (no " XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME ").";
@@ -300,12 +375,13 @@ bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
         return false;
     }
 
-    const char* enabled_extensions[] = { graphics->extension_name(), XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME };
+    // XR_DXR_display_info is optional: it lets the backend switch the display to 2D while the game shows no stereo.
+    const char* enabled_extensions[] = { graphics->extension_name(), XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME, XR_DXR_DISPLAY_INFO_EXTENSION_NAME };
     XrInstanceCreateInfo instance_info = { XR_TYPE_INSTANCE_CREATE_INFO };
     std::strncpy(instance_info.applicationInfo.applicationName, "3DGameBridge", XR_MAX_APPLICATION_NAME_SIZE - 1);
     std::strncpy(instance_info.applicationInfo.engineName, "ReShade", XR_MAX_ENGINE_NAME_SIZE - 1);
     instance_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    instance_info.enabledExtensionCount = 2;
+    instance_info.enabledExtensionCount = has_display_info ? 3 : 2;
     instance_info.enabledExtensionNames = enabled_extensions;
     XrResult result = create_instance(&instance_info, &instance);
     if (XR_FAILED(result)) {
@@ -313,6 +389,16 @@ bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
         return false;
     }
     resolve_functions();
+    if (has_display_info) {
+        resolve(get_proc_addr, instance, "xrRequestDisplayModeDXR", xrRequestDisplayModeDXR);
+    }
+    try {
+        const ConfigManager::ConfigValue value = ConfigManager::read_from_config(gb_config_displayxr_auto_2d);
+        auto_2d_enabled = value.value_type != ConfigManager::ConfigValue::Type::Bool || value.bool_value;
+    }
+    catch (std::runtime_error&) {
+        auto_2d_enabled = true;
+    }
 
     PFN_xrGetInstanceProperties get_instance_properties = nullptr;
     resolve(get_proc_addr, instance, "xrGetInstanceProperties", get_instance_properties);
@@ -375,6 +461,7 @@ DisplayXRBackend::~DisplayXRBackend() {
         return;
     }
     destroy_swapchain();
+    destroy_mono_probe_resources();
     if (convert_pipeline != 0) {
         device->destroy_pipeline(convert_pipeline);
     }
@@ -443,7 +530,12 @@ bool DisplayXRBackend::create_convert_pipeline(reshade::api::format target_forma
         device->destroy_pipeline(convert_pipeline);
         convert_pipeline = {};
     }
-    // The shader is HLSL compiled to DXBC, which serves D3D11 and D3D12. A Vulkan path needs a SPIR-V variant.
+    convert_pipeline_format = create_fullscreen_pipeline("ps_main", target_format, &convert_pipeline) ? target_format : reshade::api::format::unknown;
+    return convert_pipeline != 0;
+}
+
+bool DisplayXRBackend::create_fullscreen_pipeline(const char* pixel_shader, reshade::api::format target_format, reshade::api::pipeline* out_pipeline) {
+    // The shaders are HLSL compiled to DXBC, which serves D3D11 and D3D12. A Vulkan path needs SPIR-V variants.
     const reshade::api::device_api api = device->get_api();
     if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d12) {
         return false;
@@ -460,7 +552,7 @@ bool DisplayXRBackend::create_convert_pipeline(reshade::api::format target_forma
     }
 
     ID3DBlob* vs = compile_convert_shader("vs_main", "vs_5_0");
-    ID3DBlob* ps = compile_convert_shader("ps_main", "ps_5_0");
+    ID3DBlob* ps = compile_convert_shader(pixel_shader, "ps_5_0");
     bool created = false;
     if (vs != nullptr && ps != nullptr) {
         reshade::api::shader_desc vs_desc = {};
@@ -477,11 +569,10 @@ bool DisplayXRBackend::create_convert_pipeline(reshade::api::format target_forma
             { reshade::api::pipeline_subobject_type::render_target_formats, 1, &format },
             { reshade::api::pipeline_subobject_type::primitive_topology, 1, &topology },
         };
-        created = device->create_pipeline(convert_layout, 4, subobjects, &convert_pipeline);
+        created = device->create_pipeline(convert_layout, 4, subobjects, out_pipeline);
     }
     if (vs != nullptr) vs->Release();
     if (ps != nullptr) ps->Release();
-    convert_pipeline_format = created ? target_format : reshade::api::format::unknown;
     return created;
 }
 
@@ -509,7 +600,7 @@ void DisplayXRBackend::destroy_convert_resources() {
     }
 }
 
-bool DisplayXRBackend::convert_to_image(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer, uint32_t image_index) {
+bool DisplayXRBackend::copy_to_sampled_source(reshade::api::command_list* cmd_list, reshade::api::resource back_buffer) {
     const reshade::api::resource_desc desc = device->get_resource_desc(back_buffer);
     const reshade::api::format source_format = reshade::api::format_to_default_typed(desc.texture.format, 0);
 
@@ -523,6 +614,19 @@ bool DisplayXRBackend::convert_to_image(reshade::api::effect_runtime* runtime, r
             return false;
         }
     }
+    cmd_list->barrier(back_buffer, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+    cmd_list->barrier(convert_source, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
+    cmd_list->copy_resource(back_buffer, convert_source);
+    cmd_list->barrier(back_buffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
+    cmd_list->barrier(convert_source, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
+    return true;
+}
+
+bool DisplayXRBackend::convert_to_image(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer, uint32_t image_index) {
+    const reshade::api::resource_desc desc = device->get_resource_desc(back_buffer);
+    if (!copy_to_sampled_source(cmd_list, back_buffer)) {
+        return false;
+    }
     if (image_index >= convert_rtvs.size()) {
         convert_rtvs.resize(image_index + 1, reshade::api::resource_view{ 0 });
     }
@@ -532,12 +636,6 @@ bool DisplayXRBackend::convert_to_image(reshade::api::effect_runtime* runtime, r
             return false;
         }
     }
-
-    cmd_list->barrier(back_buffer, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
-    cmd_list->barrier(convert_source, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
-    cmd_list->copy_resource(back_buffer, convert_source);
-    cmd_list->barrier(back_buffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
-    cmd_list->barrier(convert_source, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
 
     // OpenXR hands out color swapchain images ready to render to (D3D12: RENDER_TARGET state).
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, convert_pipeline);
@@ -553,6 +651,147 @@ bool DisplayXRBackend::convert_to_image(reshade::api::effect_runtime* runtime, r
     // The runtime reads the image as soon as it is released, so submit now (a no-op in D3D11).
     runtime->get_command_queue()->flush_immediate_command_list();
     return true;
+}
+
+bool DisplayXRBackend::create_mono_probe_resources() {
+    if (mono_probe_pipeline != 0) {
+        return true;
+    }
+    const reshade::api::format format = reshade::api::format::r8g8b8a8_unorm;
+    const uint32_t width = mono_grid_x * 2, height = mono_grid_y;
+    if (!create_fullscreen_pipeline("ps_mono_probe", format, &mono_probe_pipeline)) {
+        return false;
+    }
+    const reshade::api::resource_desc target_desc(width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only,
+                                                  reshade::api::resource_usage::render_target | reshade::api::resource_usage::copy_source);
+    if (!device->create_resource(target_desc, nullptr, reshade::api::resource_usage::render_target, &mono_probe_target) ||
+        !device->create_resource_view(mono_probe_target, reshade::api::resource_usage::render_target, reshade::api::resource_view_desc(format), &mono_probe_rtv)) {
+        return false;
+    }
+    // Read back through a ring, so the CPU only maps results the GPU finished frames ago and never waits.
+    // D3D11 reads back from staging textures, D3D12 from buffers (D3D12 textures cannot live in a readback heap).
+    const bool d3d12 = device->get_api() == reshade::api::device_api::d3d12;
+    for (reshade::api::resource& readback : mono_probe_readback) {
+        const reshade::api::resource_desc readback_desc = d3d12
+            ? reshade::api::resource_desc(static_cast<uint64_t>(width) * 4 * height, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest)
+            : reshade::api::resource_desc(width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest);
+        if (!device->create_resource(readback_desc, nullptr, reshade::api::resource_usage::copy_dest, &readback)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void DisplayXRBackend::destroy_mono_probe_resources() {
+    if (queue != nullptr && mono_probe_target != 0) {
+        queue->wait_idle();
+    }
+    for (reshade::api::resource& readback : mono_probe_readback) {
+        if (readback != 0) {
+            device->destroy_resource(readback);
+            readback = {};
+        }
+    }
+    if (mono_probe_rtv != 0) {
+        device->destroy_resource_view(mono_probe_rtv);
+        mono_probe_rtv = {};
+    }
+    if (mono_probe_target != 0) {
+        device->destroy_resource(mono_probe_target);
+        mono_probe_target = {};
+    }
+    if (mono_probe_pipeline != 0) {
+        device->destroy_pipeline(mono_probe_pipeline);
+        mono_probe_pipeline = {};
+    }
+}
+
+void DisplayXRBackend::update_mono_probe(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer) {
+    // About ten probes a second: 2D/3D switching does not need more, and most frames pay nothing.
+    if (xrRequestDisplayModeDXR == nullptr || !auto_2d_enabled || (++mono_probe_frame % 6) != 0) {
+        return;
+    }
+    if (!create_mono_probe_resources()) {
+        auto_2d_enabled = false;
+        log_warning("cannot create the mono probe, automatic 2D for mono frames is off.");
+        return;
+    }
+    const uint32_t width = mono_grid_x * 2, height = mono_grid_y;
+    const bool d3d12 = device->get_api() == reshade::api::device_api::d3d12;
+
+    // Evaluate the oldest result first, before its readback slot is reused below.
+    const size_t slot = mono_probe_count % std::size(mono_probe_readback);
+    if (mono_probe_count >= std::size(mono_probe_readback)) {
+        const uint8_t* pixels = nullptr;
+        uint32_t row_pitch = width * 4;
+        void* mapped = nullptr;
+        reshade::api::subresource_data data = {};
+        if (d3d12 ? device->map_buffer_region(mono_probe_readback[slot], 0, UINT64_MAX, reshade::api::map_access::read_only, &mapped)
+                  : device->map_texture_region(mono_probe_readback[slot], 0, nullptr, reshade::api::map_access::read_only, &data)) {
+            pixels = static_cast<const uint8_t*>(d3d12 ? mapped : data.data);
+            row_pitch = d3d12 ? row_pitch : data.row_pitch;
+        }
+        if (pixels != nullptr) {
+            std::vector<float> left(static_cast<size_t>(mono_grid_x) * mono_grid_y), right(left.size());
+            for (uint32_t y = 0; y < height; y++) {
+                const uint8_t* row = pixels + static_cast<size_t>(y) * row_pitch;
+                for (uint32_t x = 0; x < mono_grid_x; x++) {
+                    const uint8_t* l = row + x * 4;
+                    const uint8_t* r = row + (x + mono_grid_x) * 4;
+                    left[static_cast<size_t>(y) * mono_grid_x + x] = (l[0] * 2 + l[1] * 5 + l[2]) / 8.0f;
+                    right[static_cast<size_t>(y) * mono_grid_x + x] = (r[0] * 2 + r[1] * 5 + r[2]) / 8.0f;
+                }
+            }
+            if (d3d12) {
+                device->unmap_buffer_region(mono_probe_readback[slot]);
+            } else {
+                device->unmap_texture_region(mono_probe_readback[slot], 0);
+            }
+            apply_mono_verdict(eyes_are_flat(left, right));
+        }
+    }
+
+    // Reduce this frame and queue its readback.
+    if (!copy_to_sampled_source(cmd_list, back_buffer)) {
+        return;
+    }
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, mono_probe_pipeline);
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, convert_layout, 0,
+                               reshade::api::descriptor_table_update{ {}, 0, 0, 1, reshade::api::descriptor_type::shader_resource_view, &convert_source_srv });
+    const reshade::api::viewport viewport = { 0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f };
+    const reshade::api::rect scissor = { 0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height) };
+    cmd_list->bind_viewports(0, 1, &viewport);
+    cmd_list->bind_scissor_rects(0, 1, &scissor);
+    cmd_list->bind_render_targets_and_depth_stencil(1, &mono_probe_rtv);
+    cmd_list->draw(3, 1, 0, 0);
+    cmd_list->barrier(mono_probe_target, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+    if (d3d12) {
+        cmd_list->copy_texture_to_buffer(mono_probe_target, 0, nullptr, mono_probe_readback[slot], 0, width, height);
+    } else {
+        cmd_list->copy_texture_region(mono_probe_target, 0, nullptr, mono_probe_readback[slot], 0, nullptr);
+    }
+    cmd_list->barrier(mono_probe_target, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
+    mono_probe_count++;
+    (void)runtime;
+}
+
+void DisplayXRBackend::apply_mono_verdict(bool mono) {
+    // Switch to 2D only after the frame has been flat for about half a second (SuperDepth3D toggled off, menus and
+    // loading screens), and back to 3D on the second probe that sees depth, so a scene cut does not flicker the lens.
+    // While in 2D both views show the left eye, so a flat picture placed at a depth (shifted eyes) stays sharp.
+    mono_streak = mono ? mono_streak + 1 : 0;
+    stereo_streak = mono ? 0 : stereo_streak + 1;
+    const bool want_2d = display_2d ? stereo_streak < 2 : mono_streak >= 5;
+    if (want_2d == display_2d) {
+        return;
+    }
+    const XrResult result = xrRequestDisplayModeDXR(session, want_2d ? XR_DISPLAY_MODE_2D_DXR : XR_DISPLAY_MODE_3D_DXR);
+    if (XR_SUCCEEDED(result)) {
+        display_2d = want_2d;
+        log_info(want_2d ? "the eyes show a flat picture: display switched to 2D" : "the eyes show depth: display switched to 3D");
+    } else {
+        log_failure_once("xrRequestDisplayModeDXR", result);
+    }
 }
 
 void DisplayXRBackend::destroy_swapchain() {
@@ -714,6 +953,9 @@ GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtim
             else {
                 const bool copied = convert ? convert_to_image(runtime, cmd_list, back_buffer, image_index)
                                             : graphics->copy_to_image(runtime, cmd_list, back_buffer, image_index);
+                if (copied) {
+                    update_mono_probe(runtime, cmd_list, back_buffer);
+                }
                 xrReleaseSwapchainImage(swapchain, nullptr);
 
                 if (copied) {
@@ -724,7 +966,8 @@ GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtim
                         projection_views[eye].pose = views[eye].pose;
                         projection_views[eye].fov = views[eye].fov;
                         projection_views[eye].subImage.swapchain = swapchain;
-                        projection_views[eye].subImage.imageRect.offset = { static_cast<int32_t>(eye) * half_width, 0 };
+                        const int32_t source_eye = display_2d ? 0 : static_cast<int32_t>(eye);
+                        projection_views[eye].subImage.imageRect.offset = { source_eye * half_width, 0 };
                         projection_views[eye].subImage.imageRect.extent = { half_width, static_cast<int32_t>(swapchain_height) };
                         projection_views[eye].subImage.imageArrayIndex = 0;
                     }
@@ -796,6 +1039,9 @@ void DisplayXRBackend::draw_status_overlay(reshade::api::effect_runtime*, const 
         ImGui::Text("Swapchain: %ux%u, format %s", swapchain_width, swapchain_height, format_name.c_str());
     }
     ImGui::Text("Frames submitted: %llu", static_cast<unsigned long long>(frames_submitted));
+    if (xrRequestDisplayModeDXR != nullptr && auto_2d_enabled) {
+        ImGui::Text("Display: %s (2D while the eyes show a flat picture)", display_2d ? "2D" : "3D");
+    }
     ImGui::TextUnformatted("The woven image is hidden while this overlay is open.");
     const std::string& message = error_message.empty() ? status_message : error_message;
     if (!message.empty()) {
