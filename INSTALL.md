@@ -113,7 +113,7 @@ How it works:
 - The add-on loads the active OpenXR runtime itself (the `ActiveRuntime` registry value, or `XR_RUNTIME_JSON`). It creates an OpenXR session on the game's own graphics device, and every frame submits the left and right halves of the back buffer as the two eye views. The game itself needs no OpenXR support.
 - The runtime presents the woven image into a borderless window that the add-on keeps over the game's client area. That window never takes focus and ignores the mouse, so all input still goes to the game.
 - While the ReShade overlay is open, the woven image is hidden so the menu stays readable.
-- Back buffer formats the runtime does not accept as a swapchain format (for example the 10-bit format many Unreal Engine games use) are converted to 8-bit sRGB on the GPU first.
+- Deeper back buffers (for example the 10-bit format many Unreal Engine games use) are submitted as they are when the runtime supports `XR_DXR_swapchain_color_encoding`, and converted to 8-bit sRGB on the GPU otherwise.
 - While the two eyes show one flat picture, the display is switched to 2D. That covers menus and loading screens that SuperDepth3D places at a single depth, and moments when SuperDepth3D is off. During that time both eyes show the left image, so the picture stays sharp. The display returns to 3D as soon as there is depth again. To turn this off, set `displayxr_auto_2d=false` in `[3DGameBridge]`.
 
 The add-on silently falls back to the SR weaver when the DisplayXR backend cannot be used: no OpenXR runtime is registered, the active runtime is not DisplayXR, the game is 32-bit (DisplayXR has no 32-bit runtime), or the session cannot be created. The reason is written to the ReShade log.

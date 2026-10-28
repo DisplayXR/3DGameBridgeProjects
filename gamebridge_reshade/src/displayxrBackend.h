@@ -41,6 +41,7 @@ class DisplayXRBackend : public IGraphicsApi {
     uint32_t swapchain_width = 0, swapchain_height = 0;
     reshade::api::format swapchain_source_format = reshade::api::format::unknown;
     bool swapchain_failed = false;
+    bool color_encoding_available = false;
 
     // Format conversion, for back buffers whose format the runtime does not offer (e.g. 10-bit R10G10B10A2):
     // the frame is copied to a sampled texture and drawn into an 8-bit _SRGB swapchain image.

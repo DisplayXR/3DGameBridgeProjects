@@ -12,6 +12,7 @@
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/XR_DXR_win32_window_binding.h>
 #include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_swapchain_color_encoding.h>
 
 #include <d3dcommon.h>
 
@@ -360,11 +361,12 @@ bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
     }
     std::vector<XrExtensionProperties> extensions(extension_count, { XR_TYPE_EXTENSION_PROPERTIES });
     enumerate_extensions(nullptr, extension_count, &extension_count, extensions.data());
-    bool has_graphics = false, has_window_binding = false, has_display_info = false;
+    bool has_graphics = false, has_window_binding = false, has_display_info = false, has_color_encoding = false;
     for (const XrExtensionProperties& extension : extensions) {
         has_graphics |= std::strcmp(extension.extensionName, graphics->extension_name()) == 0;
         has_window_binding |= std::strcmp(extension.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0;
         has_display_info |= std::strcmp(extension.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0;
+        has_color_encoding |= std::strcmp(extension.extensionName, XR_DXR_SWAPCHAIN_COLOR_ENCODING_EXTENSION_NAME) == 0;
     }
     if (!has_window_binding) {
         status_message = "The active OpenXR runtime is not DisplayXR (no " XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME ").";
@@ -375,14 +377,22 @@ bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
         return false;
     }
 
-    // XR_DXR_display_info is optional: it lets the backend switch the display to 2D while the game shows no stereo.
-    const char* enabled_extensions[] = { graphics->extension_name(), XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME, XR_DXR_DISPLAY_INFO_EXTENSION_NAME };
+    // Optional extensions: XR_DXR_display_info lets the backend switch the display to 2D while the game shows no
+    // stereo, XR_DXR_swapchain_color_encoding lets it submit a 10-bit back buffer without converting it.
+    std::vector<const char*> enabled_extensions = { graphics->extension_name(), XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME };
+    if (has_display_info) {
+        enabled_extensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (has_color_encoding) {
+        enabled_extensions.push_back(XR_DXR_SWAPCHAIN_COLOR_ENCODING_EXTENSION_NAME);
+    }
+    color_encoding_available = has_color_encoding;
     XrInstanceCreateInfo instance_info = { XR_TYPE_INSTANCE_CREATE_INFO };
     std::strncpy(instance_info.applicationInfo.applicationName, "3DGameBridge", XR_MAX_APPLICATION_NAME_SIZE - 1);
     std::strncpy(instance_info.applicationInfo.engineName, "ReShade", XR_MAX_ENGINE_NAME_SIZE - 1);
     instance_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    instance_info.enabledExtensionCount = has_display_info ? 3 : 2;
-    instance_info.enabledExtensionNames = enabled_extensions;
+    instance_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+    instance_info.enabledExtensionNames = enabled_extensions.data();
     XrResult result = create_instance(&instance_info, &instance);
     if (XR_FAILED(result)) {
         status_message = "xrCreateInstance failed (" + std::to_string(result) + ").";
@@ -820,16 +830,18 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
         return false;
     }
 
-    // The game's 8-bit back buffer holds display-encoded (sRGB) values. DisplayXR reads a UNORM swapchain as linear
-    // and an _SRGB swapchain as encoded, so the same bytes go into the _SRGB variant: a raw copy, no conversion.
-    // Formats without an _SRGB variant (10-bit, float) are used as they are.
+    // The game's back buffer holds display-encoded (sRGB) values, and DisplayXR reads a UNORM swapchain as linear.
+    // - 8-bit: the same bytes go into the _SRGB variant of the format, a raw copy (understood by every runtime).
+    // - Deeper formats have no _SRGB variant: declare the swapchain display-encoded with
+    //   XR_DXR_swapchain_color_encoding and copy raw, or, on a runtime without it, convert (below).
     const reshade::api::format typed = reshade::api::format_to_default_typed(desc.texture.format, 0);
     const reshade::api::format srgb = reshade::api::format_to_default_typed(desc.texture.format, 1);
     std::vector<reshade::api::format> candidates;
     if (srgb != typed) {
         candidates.push_back(srgb);
+    } else if (color_encoding_available) {
+        candidates.push_back(typed);
     }
-    candidates.push_back(typed);
 
     uint32_t format_count = 0;
     xrEnumerateSwapchainFormats(session, 0, &format_count, nullptr);
@@ -864,7 +876,12 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
         return false;
     }
 
+    XrSwapchainColorEncodingCreateInfoDXR encoding_info = { XR_TYPE_SWAPCHAIN_COLOR_ENCODING_CREATE_INFO_DXR };
+    encoding_info.colorEncoding = XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR;
+    const bool declare_encoded = !convert && chosen == typed && srgb == typed;
+
     XrSwapchainCreateInfo swapchain_info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    swapchain_info.next = declare_encoded ? &encoding_info : nullptr;
     swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
     swapchain_info.format = graphics->native_format(chosen);
     swapchain_info.sampleCount = 1;
@@ -874,6 +891,12 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
     swapchain_info.arraySize = 1;
     swapchain_info.mipCount = 1;
     XrResult result = xrCreateSwapchain(session, &swapchain_info, &swapchain);
+    if (result == XR_ERROR_FEATURE_UNSUPPORTED && declare_encoded) {
+        // This session's compositor cannot read the format as display-encoded (e.g. a service session): convert.
+        log_info("the runtime cannot take this format display-encoded here, converting instead");
+        color_encoding_available = false;
+        return ensure_swapchain(desc);
+    }
     if (XR_FAILED(result) || !graphics->enumerate_images(swapchain, get_proc_addr, instance)) {
         status_message = "xrCreateSwapchain failed (" + std::to_string(result) + ").";
         log_warning(status_message);
@@ -885,7 +908,10 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
     swapchain_width = desc.texture.width;
     swapchain_height = desc.texture.height;
     swapchain_source_format = desc.texture.format;
-    format_name = std::to_string(static_cast<uint32_t>(chosen)) + (convert ? " (sRGB, converted from " + std::to_string(static_cast<uint32_t>(desc.texture.format)) + ")" : chosen == srgb && srgb != typed ? " (sRGB)" : "");
+    format_name = std::to_string(static_cast<uint32_t>(chosen)) +
+                  (convert ? " (sRGB, converted from " + std::to_string(static_cast<uint32_t>(desc.texture.format)) + ")"
+                   : declare_encoded ? " (declared sRGB-encoded)"
+                   : chosen == srgb && srgb != typed ? " (sRGB)" : "");
     log_info("swapchain " + std::to_string(swapchain_width) + "x" + std::to_string(swapchain_height) + " format " + format_name);
     return true;
 }
