@@ -13,6 +13,7 @@
 
 #include <openxr/openxr.h>
 #include <string>
+#include <vector>
 
 // Weaving backend that hands the side-by-side frame to a DisplayXR OpenXR runtime instead of weaving it in-process.
 // The add-on becomes an ordinary OpenXR application on the game's own graphics device: it submits the left and
@@ -39,6 +40,18 @@ class DisplayXRBackend : public IGraphicsApi {
     uint32_t swapchain_width = 0, swapchain_height = 0;
     reshade::api::format swapchain_source_format = reshade::api::format::unknown;
     bool swapchain_failed = false;
+
+    // Format conversion, for back buffers whose format the runtime does not offer (e.g. 10-bit R10G10B10A2):
+    // the frame is copied to a sampled texture and drawn into an 8-bit _SRGB swapchain image.
+    bool convert = false;
+    reshade::api::device* device = nullptr;
+    reshade::api::command_queue* queue = nullptr;
+    reshade::api::pipeline_layout convert_layout = {};
+    reshade::api::pipeline convert_pipeline = {};
+    reshade::api::format convert_pipeline_format = reshade::api::format::unknown;
+    reshade::api::resource convert_source = {};
+    reshade::api::resource_view convert_source_srv = {};
+    std::vector<reshade::api::resource_view> convert_rtvs;
 
     bool weaving_enabled = true;
     bool reshade_overlay_open = false;
@@ -75,6 +88,9 @@ class DisplayXRBackend : public IGraphicsApi {
     void poll_events();
     void destroy_swapchain();
     bool ensure_swapchain(const reshade::api::resource_desc& desc);
+    bool create_convert_pipeline(reshade::api::format target_format);
+    void destroy_convert_resources();
+    bool convert_to_image(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer, uint32_t image_index);
 
 public:
     /// \brief Whether ReShade.ini selects the DisplayXR backend

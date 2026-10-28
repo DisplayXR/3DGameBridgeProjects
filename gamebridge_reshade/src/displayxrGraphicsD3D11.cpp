@@ -57,6 +57,10 @@ public:
         return XR_SUCCEEDED(enumerate(swapchain, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())));
     }
 
+    uint64_t image_handle(uint32_t image_index) const override {
+        return image_index < images.size() ? reinterpret_cast<uint64_t>(images[image_index].texture) : 0;
+    }
+
     void release_images() override {
         images.clear();
     }

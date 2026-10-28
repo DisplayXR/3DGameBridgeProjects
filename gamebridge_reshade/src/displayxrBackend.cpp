@@ -12,6 +12,8 @@
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/XR_DXR_win32_window_binding.h>
 
+#include <d3dcommon.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -28,6 +30,18 @@ static void log_info(const std::string& message) {
 
 static void log_warning(const std::string& message) {
     reshade::log_message(reshade::log_level::warning, ("DisplayXR: " + message).c_str());
+}
+
+// Logs a failed OpenXR call once per call site and result, so a failing frame loop is visible without flooding the log.
+static void log_failure_once(const char* call, XrResult result) {
+    static std::vector<std::pair<const char*, XrResult>> logged;
+    for (const auto& entry : logged) {
+        if (entry.first == call && entry.second == result) {
+            return;
+        }
+    }
+    logged.emplace_back(call, result);
+    log_warning(std::string(call) + " failed (" + std::to_string(result) + ")");
 }
 
 static const char* session_state_name(XrSessionState state) {
@@ -102,6 +116,45 @@ static std::wstring read_runtime_library_path(const std::string& manifest_path) 
         MultiByteToWideChar(CP_UTF8, 0, library.c_str(), -1, &wide[0], wide_length);
     }
     return wide;
+}
+
+// Draws the back buffer into an 8-bit _SRGB swapchain image, for back buffer formats the runtime does not offer.
+// The back buffer holds display-encoded values: the shader decodes them, and the _SRGB render target encodes them
+// again, so the pixels keep their meaning and only lose the precision the 8-bit target cannot hold.
+static const char convert_shader_source[] = R"(
+Texture2D<float4> source : register(t0);
+
+void vs_main(uint id : SV_VertexID, out float4 position : SV_Position)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 ps_main(float4 position : SV_Position) : SV_Target
+{
+    float4 color = source.Load(int3(position.xy, 0));
+    float3 low = color.rgb / 12.92;
+    float3 high = pow((color.rgb + 0.055) / 1.055, 2.4);
+    return float4(color.rgb <= 0.04045 ? low : high, color.a);
+}
+)";
+
+// Compiles the conversion shader with the system's d3dcompiler_47.dll (part of Windows since 8.1).
+static ID3DBlob* compile_convert_shader(const char* entry_point, const char* target) {
+    using d3dcompile_fn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    static HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = compiler != nullptr ? reinterpret_cast<d3dcompile_fn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+    if (compile == nullptr) {
+        return nullptr;
+    }
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    compile(convert_shader_source, sizeof(convert_shader_source) - 1, "displayxr_convert", nullptr, nullptr, entry_point, target, 0, 0, &code, &errors);
+    if (errors != nullptr) {
+        reshade::log_message(reshade::log_level::warning, static_cast<const char*>(errors->GetBufferPointer()));
+        errors->Release();
+    }
+    return code;
 }
 
 bool DisplayXRBackend::is_requested() {
@@ -203,7 +256,8 @@ void DisplayXRBackend::resolve_functions() {
 }
 
 bool DisplayXRBackend::initialize(reshade::api::effect_runtime* runtime) {
-    reshade::api::device* device = runtime->get_device();
+    device = runtime->get_device();
+    queue = runtime->get_command_queue();
     switch (device->get_api()) {
     case reshade::api::device_api::d3d11:
         graphics = create_displayxr_graphics_d3d11(device);
@@ -321,6 +375,12 @@ DisplayXRBackend::~DisplayXRBackend() {
         return;
     }
     destroy_swapchain();
+    if (convert_pipeline != 0) {
+        device->destroy_pipeline(convert_pipeline);
+    }
+    if (convert_layout != 0) {
+        device->destroy_pipeline_layout(convert_layout);
+    }
     if (space != XR_NULL_HANDLE) {
         xrDestroySpace(space);
     }
@@ -375,7 +435,128 @@ void DisplayXRBackend::poll_events() {
     }
 }
 
+bool DisplayXRBackend::create_convert_pipeline(reshade::api::format target_format) {
+    if (convert_pipeline != 0 && convert_pipeline_format == target_format) {
+        return true;
+    }
+    if (convert_pipeline != 0) {
+        device->destroy_pipeline(convert_pipeline);
+        convert_pipeline = {};
+    }
+    // The shader is HLSL compiled to DXBC, which serves D3D11 and D3D12. A Vulkan path needs a SPIR-V variant.
+    const reshade::api::device_api api = device->get_api();
+    if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d12) {
+        return false;
+    }
+    if (convert_layout == 0) {
+        reshade::api::descriptor_range range = {};
+        range.count = 1;
+        range.visibility = reshade::api::shader_stage::pixel;
+        range.type = reshade::api::descriptor_type::shader_resource_view;
+        const reshade::api::pipeline_layout_param param(range);
+        if (!device->create_pipeline_layout(1, &param, &convert_layout)) {
+            return false;
+        }
+    }
+
+    ID3DBlob* vs = compile_convert_shader("vs_main", "vs_5_0");
+    ID3DBlob* ps = compile_convert_shader("ps_main", "ps_5_0");
+    bool created = false;
+    if (vs != nullptr && ps != nullptr) {
+        reshade::api::shader_desc vs_desc = {};
+        vs_desc.code = vs->GetBufferPointer();
+        vs_desc.code_size = vs->GetBufferSize();
+        reshade::api::shader_desc ps_desc = {};
+        ps_desc.code = ps->GetBufferPointer();
+        ps_desc.code_size = ps->GetBufferSize();
+        reshade::api::format format = target_format;
+        reshade::api::primitive_topology topology = reshade::api::primitive_topology::triangle_list;
+        reshade::api::pipeline_subobject subobjects[] = {
+            { reshade::api::pipeline_subobject_type::vertex_shader, 1, &vs_desc },
+            { reshade::api::pipeline_subobject_type::pixel_shader, 1, &ps_desc },
+            { reshade::api::pipeline_subobject_type::render_target_formats, 1, &format },
+            { reshade::api::pipeline_subobject_type::primitive_topology, 1, &topology },
+        };
+        created = device->create_pipeline(convert_layout, 4, subobjects, &convert_pipeline);
+    }
+    if (vs != nullptr) vs->Release();
+    if (ps != nullptr) ps->Release();
+    convert_pipeline_format = created ? target_format : reshade::api::format::unknown;
+    return created;
+}
+
+void DisplayXRBackend::destroy_convert_resources() {
+    if (convert_source == 0 && convert_rtvs.empty()) {
+        return;
+    }
+    // In D3D12 the copy and the draw of the previous frame may still be in flight.
+    if (queue != nullptr) {
+        queue->wait_idle();
+    }
+    for (reshade::api::resource_view rtv : convert_rtvs) {
+        if (rtv != 0) {
+            device->destroy_resource_view(rtv);
+        }
+    }
+    convert_rtvs.clear();
+    if (convert_source_srv != 0) {
+        device->destroy_resource_view(convert_source_srv);
+        convert_source_srv = {};
+    }
+    if (convert_source != 0) {
+        device->destroy_resource(convert_source);
+        convert_source = {};
+    }
+}
+
+bool DisplayXRBackend::convert_to_image(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource back_buffer, uint32_t image_index) {
+    const reshade::api::resource_desc desc = device->get_resource_desc(back_buffer);
+    const reshade::api::format source_format = reshade::api::format_to_default_typed(desc.texture.format, 0);
+
+    // Back buffers usually cannot be sampled, so the frame goes through a copy that can.
+    if (convert_source == 0) {
+        const reshade::api::resource_desc source_desc(desc.texture.width, desc.texture.height, 1, 1, source_format, 1,
+                                                      reshade::api::memory_heap::gpu_only,
+                                                      reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest);
+        if (!device->create_resource(source_desc, nullptr, reshade::api::resource_usage::shader_resource, &convert_source) ||
+            !device->create_resource_view(convert_source, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(source_format), &convert_source_srv)) {
+            return false;
+        }
+    }
+    if (image_index >= convert_rtvs.size()) {
+        convert_rtvs.resize(image_index + 1, reshade::api::resource_view{ 0 });
+    }
+    if (convert_rtvs[image_index] == 0) {
+        const reshade::api::resource image = { graphics->image_handle(image_index) };
+        if (image == 0 || !device->create_resource_view(image, reshade::api::resource_usage::render_target, reshade::api::resource_view_desc(convert_pipeline_format), &convert_rtvs[image_index])) {
+            return false;
+        }
+    }
+
+    cmd_list->barrier(back_buffer, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+    cmd_list->barrier(convert_source, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
+    cmd_list->copy_resource(back_buffer, convert_source);
+    cmd_list->barrier(back_buffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
+    cmd_list->barrier(convert_source, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
+
+    // OpenXR hands out color swapchain images ready to render to (D3D12: RENDER_TARGET state).
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, convert_pipeline);
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, convert_layout, 0,
+                               reshade::api::descriptor_table_update{ {}, 0, 0, 1, reshade::api::descriptor_type::shader_resource_view, &convert_source_srv });
+    const reshade::api::viewport viewport = { 0.0f, 0.0f, static_cast<float>(desc.texture.width), static_cast<float>(desc.texture.height), 0.0f, 1.0f };
+    const reshade::api::rect scissor = { 0, 0, static_cast<int32_t>(desc.texture.width), static_cast<int32_t>(desc.texture.height) };
+    cmd_list->bind_viewports(0, 1, &viewport);
+    cmd_list->bind_scissor_rects(0, 1, &scissor);
+    cmd_list->bind_render_targets_and_depth_stencil(1, &convert_rtvs[image_index]);
+    cmd_list->draw(3, 1, 0, 0);
+
+    // The runtime reads the image as soon as it is released, so submit now (a no-op in D3D11).
+    runtime->get_command_queue()->flush_immediate_command_list();
+    return true;
+}
+
 void DisplayXRBackend::destroy_swapchain() {
+    destroy_convert_resources();
     if (swapchain != XR_NULL_HANDLE) {
         graphics->release_images();
         xrDestroySwapchain(swapchain);
@@ -395,6 +576,7 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
     }
     if (desc.texture.samples > 1) {
         status_message = "Multisampled back buffers are not supported.";
+        log_warning(status_message);
         swapchain_failed = true;
         return false;
     }
@@ -426,8 +608,19 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
             break;
         }
     }
+    convert = false;
+    if (chosen == reshade::api::format::unknown) {
+        for (reshade::api::format target : { reshade::api::format::r8g8b8a8_unorm_srgb, reshade::api::format::b8g8r8a8_unorm_srgb }) {
+            if (chosen == reshade::api::format::unknown && std::find(formats.begin(), formats.end(), graphics->native_format(target)) != formats.end() &&
+                create_convert_pipeline(target)) {
+                chosen = target;
+                convert = true;
+            }
+        }
+    }
     if (chosen == reshade::api::format::unknown) {
         status_message = "The runtime offers no swapchain format matching the back buffer (" + std::to_string(static_cast<uint32_t>(desc.texture.format)) + ").";
+        log_warning(status_message);
         swapchain_failed = true;
         return false;
     }
@@ -444,6 +637,7 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
     XrResult result = xrCreateSwapchain(session, &swapchain_info, &swapchain);
     if (XR_FAILED(result) || !graphics->enumerate_images(swapchain, get_proc_addr, instance)) {
         status_message = "xrCreateSwapchain failed (" + std::to_string(result) + ").";
+        log_warning(status_message);
         swapchain_failed = true;
         destroy_swapchain();
         return false;
@@ -452,10 +646,7 @@ bool DisplayXRBackend::ensure_swapchain(const reshade::api::resource_desc& desc)
     swapchain_width = desc.texture.width;
     swapchain_height = desc.texture.height;
     swapchain_source_format = desc.texture.format;
-    format_name = std::to_string(static_cast<uint32_t>(chosen)) + (chosen == srgb && srgb != typed ? " (sRGB)" : "");
-    if (srgb == typed && (typed == reshade::api::format::r10g10b10a2_unorm || typed == reshade::api::format::b10g10r10a2_unorm)) {
-        log_warning("10-bit UNORM back buffer: the runtime reads it as linear, colors may look washed out.");
-    }
+    format_name = std::to_string(static_cast<uint32_t>(chosen)) + (convert ? " (sRGB, converted from " + std::to_string(static_cast<uint32_t>(desc.texture.format)) + ")" : chosen == srgb && srgb != typed ? " (sRGB)" : "");
     log_info("swapchain " + std::to_string(swapchain_width) + "x" + std::to_string(swapchain_height) + " format " + format_name);
     return true;
 }
@@ -470,10 +661,14 @@ GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtim
     }
 
     XrFrameState frame_state = { XR_TYPE_FRAME_STATE };
-    if (XR_FAILED(xrWaitFrame(session, nullptr, &frame_state))) {
+    XrResult result = xrWaitFrame(session, nullptr, &frame_state);
+    if (XR_FAILED(result)) {
+        log_failure_once("xrWaitFrame", result);
         return GENERAL_FAIL;
     }
-    if (XR_FAILED(xrBeginFrame(session, nullptr))) {
+    result = xrBeginFrame(session, nullptr);
+    if (XR_FAILED(result)) {
+        log_failure_once("xrBeginFrame", result);
         return GENERAL_FAIL;
     }
 
@@ -482,8 +677,14 @@ GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtim
     const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer) };
     uint32_t layer_count = 0;
 
-    if (frame_state.shouldRender && weaving_enabled && !reshade_overlay_open) {
-        reshade::api::device* device = runtime->get_device();
+    if (!frame_state.shouldRender || !weaving_enabled || reshade_overlay_open) {
+        static bool logged_skip = false;
+        if (!logged_skip) {
+            logged_skip = true;
+            log_info(std::string("not submitting: shouldRender=") + (frame_state.shouldRender ? "1" : "0") + " weaving=" + (weaving_enabled ? "1" : "0") + " reshade_overlay=" + (reshade_overlay_open ? "1" : "0"));
+        }
+    }
+    else {
         const reshade::api::resource back_buffer = device->get_resource_from_view(rtv);
         const reshade::api::resource_desc desc = device->get_resource_desc(back_buffer);
         current_buffer_format = desc.texture.format;
@@ -496,14 +697,23 @@ GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtim
         XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
         uint32_t view_count = 0;
 
+        XrResult locate_result = XR_ERROR_RUNTIME_FAILURE;
         if (ensure_swapchain(desc) &&
-            XR_SUCCEEDED(xrLocateViews(session, &locate_info, &view_state, 2, &view_count, views)) && view_count == 2) {
+            (XR_SUCCEEDED(locate_result = xrLocateViews(session, &locate_info, &view_state, 2, &view_count, views)) || (log_failure_once("xrLocateViews", locate_result), false)) &&
+            view_count == 2) {
             uint32_t image_index = 0;
             XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
             wait_info.timeout = XR_INFINITE_DURATION;
-            if (XR_SUCCEEDED(xrAcquireSwapchainImage(swapchain, nullptr, &image_index)) &&
-                XR_SUCCEEDED(xrWaitSwapchainImage(swapchain, &wait_info))) {
-                const bool copied = graphics->copy_to_image(runtime, cmd_list, back_buffer, image_index);
+            XrResult image_result = xrAcquireSwapchainImage(swapchain, nullptr, &image_index);
+            if (XR_SUCCEEDED(image_result)) {
+                image_result = xrWaitSwapchainImage(swapchain, &wait_info);
+            }
+            if (XR_FAILED(image_result)) {
+                log_failure_once("xrAcquire/WaitSwapchainImage", image_result);
+            }
+            else {
+                const bool copied = convert ? convert_to_image(runtime, cmd_list, back_buffer, image_index)
+                                            : graphics->copy_to_image(runtime, cmd_list, back_buffer, image_index);
                 xrReleaseSwapchainImage(swapchain, nullptr);
 
                 if (copied) {
@@ -532,7 +742,9 @@ GbResult DisplayXRBackend::on_reshade_finish_effects(reshade::api::effect_runtim
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     end_info.layerCount = layer_count;
     end_info.layers = layers;
-    if (XR_FAILED(xrEndFrame(session, &end_info))) {
+    result = xrEndFrame(session, &end_info);
+    if (XR_FAILED(result)) {
+        log_failure_once("xrEndFrame", result);
         return GENERAL_FAIL;
     }
     if (layer_count > 0) {

@@ -35,6 +35,9 @@ public:
     /// \brief Enumerates the images of a newly created swapchain
     virtual bool enumerate_images(XrSwapchain swapchain, PFN_xrGetInstanceProcAddr get_proc_addr, XrInstance instance) = 0;
 
+    /// \brief The native handle of a swapchain image (ID3D11Texture2D*, ID3D12Resource*), usable as a ReShade resource
+    virtual uint64_t image_handle(uint32_t image_index) const = 0;
+
     /// \brief Forgets the images of the current swapchain, before it is destroyed
     virtual void release_images() = 0;
 
